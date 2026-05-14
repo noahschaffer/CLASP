@@ -16,3 +16,13 @@ Install dependencies with uv:
 ```bash
 uv pip sync requirements.txt
 ```
+
+## Generating paired spectrogram/caption data
+
+### Audio Flamingo Captioning
+
+### CLASP HF dataset
+
+### CLASP DataLoader
+
+## Fine-tuning CLIP on CLASP data
