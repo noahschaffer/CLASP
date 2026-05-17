@@ -4,13 +4,12 @@ import argparse
 from pathlib import Path
 
 import torch
-import torchaudio
 from transformers import AudioFlamingo3ForConditionalGeneration, AutoProcessor
 
 CAPTION_PROMPT = (
-    "Describe all the sounds present in this audio clip in detail. "
-    "For each sound, describe what is producing it and how it sounds. "
-    "Be specific and descriptive."
+    "Describe the sounds in this audio clip in 1-2 sentences. "
+    "Be specific about what is producing each sound. "
+    "Do not include timestamps."
 )
 
 def load_model(model_id):
@@ -25,29 +24,30 @@ def load_model(model_id):
     print("Model loaded.", flush=True)
     return model, processor
 
-def generate_caption(audio_path, model, processor):
-    waveform, sr = torchaudio.load(audio_path)
-    if sr != 16000:
-        waveform = torchaudio.transforms.Resample(sr, 16000)(waveform)
-    waveform = waveform.mean(dim=0)  # mono
-
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "audio", "audio": waveform.numpy()},
-            {"type": "text", "text": CAPTION_PROMPT}
-        ]
-    }]
+def generate_captions_batch(audio_paths, model, processor):
+    conversations = [
+        [{
+            "role": "user",
+            "content": [
+                {"type": "audio", "path": str(p)},
+                {"type": "text", "text": CAPTION_PROMPT},
+            ]
+        }]
+        for p in audio_paths
+    ]
 
     inputs = processor.apply_chat_template(
-        messages,
+        conversations,
+        tokenize=True,
         add_generation_prompt=True,
-        return_tensors="pt",
         return_dict=True,
     ).to(model.device)
 
+    inputs = {k: v.to(torch.bfloat16) if v.dtype == torch.float32 else v
+              for k, v in inputs.items()}
+
     with torch.no_grad():
-        output = model.generate(
+        outputs = model.generate(
             **inputs,
             max_new_tokens=128,
             temperature=0.7,
@@ -56,9 +56,12 @@ def generate_caption(audio_path, model, processor):
             repetition_penalty=1.1,
         )
 
-    return processor.decode(output[0], skip_special_tokens=True)
+    return processor.batch_decode(
+        outputs[:, inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
 
-def caption_clips(audio_dir, output_json, model, processor, subsample=None):
+def caption_clips(audio_dir, output_json, model, processor, batch_size=8, subsample=None):
     audio_files = sorted(Path(audio_dir).glob("*.wav"))
 
     if subsample is not None:
@@ -74,21 +77,22 @@ def caption_clips(audio_dir, output_json, model, processor, subsample=None):
     pending = [f for f in audio_files if f.stem not in captions]
     print(f"Captioning {len(pending)} clips ({len(captions)} already done)", flush=True)
 
-    for i, audio_path in enumerate(pending):
+    for i in range(0, len(pending), batch_size):
+        batch = pending[i:i+batch_size]
         try:
-            caption = generate_caption(str(audio_path), model, processor)
-            captions[audio_path.stem] = caption
+            results = generate_captions_batch(batch, model, processor)
+            for audio_path, caption in zip(batch, results):
+                captions[audio_path.stem] = caption
         except Exception as e:
-            print(f"Failed {audio_path.stem}: {e}", flush=True)
-            captions[audio_path.stem] = None
+            print(f"Batch {i} failed: {e}", flush=True)
+            for audio_path in batch:
+                captions[audio_path.stem] = None
 
-        # Save incrementally every 100 clips
         if i % 100 == 0:
             with open(output_json, "w") as f:
                 json.dump(captions, f, indent=2)
             print(f"[{i}/{len(pending)}] saved checkpoint", flush=True)
 
-    # Final save
     with open(output_json, "w") as f:
         json.dump(captions, f, indent=2)
 
@@ -98,6 +102,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="nvidia/audio-flamingo-3-hf",
                         help="HuggingFace model ID")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Number of clips to process per batch")
     parser.add_argument("--subsample", type=int, default=None,
                         help="Only caption the first N clips (for testing)")
     parser.add_argument("--balanced_dir", default="./audioset_balanced")
@@ -108,11 +114,13 @@ if __name__ == "__main__":
                         help="Only caption the balanced set")
     args = parser.parse_args()
 
+    print("Loading AudioFlamingo Model", flush=True)
     model, processor = load_model(args.model)
 
+    print("AF loaded, captioning clips", flush=True)
     caption_clips(args.balanced_dir, args.balanced_out, model, processor,
-                  subsample=args.subsample)
+                  batch_size=args.batch_size, subsample=args.subsample)
 
     if not args.skip_eval:
         caption_clips(args.eval_dir, args.eval_out, model, processor,
-                      subsample=args.subsample)
+                      batch_size=args.batch_size, subsample=args.subsample)

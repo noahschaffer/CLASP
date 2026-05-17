@@ -1,6 +1,4 @@
-# CLASP
-
-**Contrastive Language-Audio-Spectrogram Pretraining**
+# CLASP: Contrastive Language-Audio-Spectrogram Pretraining
 
 ## Environment Setup
 
