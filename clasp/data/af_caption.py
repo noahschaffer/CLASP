@@ -104,7 +104,9 @@ if __name__ == "__main__":
                         help="HuggingFace model ID")
     parser.add_argument("--batch_size", type=int, default=8,
                         help="Number of clips to process per batch")
-    parser.add_argument("--subsample", type=int, default=None,
+    parser.add_argument("--subsample_train", type=int, default=None,
+                        help="Only caption the first N clips (for testing)")
+    parser.add_argument("--subsample_eval", type=int, default=None,
                         help="Only caption the first N clips (for testing)")
     parser.add_argument("--balanced_dir", default="./audioset_balanced")
     parser.add_argument("--eval_dir", default="./audioset_eval")
@@ -119,8 +121,8 @@ if __name__ == "__main__":
 
     print("AF loaded, captioning clips", flush=True)
     caption_clips(args.balanced_dir, args.balanced_out, model, processor,
-                  batch_size=args.batch_size, subsample=args.subsample)
+                  batch_size=args.batch_size, subsample=args.subsample_train)
 
     if not args.skip_eval:
         caption_clips(args.eval_dir, args.eval_out, model, processor,
-                      batch_size=args.batch_size, subsample=args.subsample)
+                      batch_size=args.batch_size, subsample=args.subsample_eval)

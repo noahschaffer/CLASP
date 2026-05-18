@@ -150,23 +150,25 @@ if __name__ == "__main__":
     parser.add_argument("--eval_csv", default="eval_segments.csv")
     parser.add_argument("--hub_repo", required=True,
                         help="HuggingFace repo to push to, e.g. username/clasp-audioset")
-    parser.add_argument("--subsample", type=int, default=None,
+    parser.add_argument("--subsample_train", type=int, default=None,
+                        help="Only process first N records (for testing)")
+    parser.add_argument("--subsample_eval", type=int, default=None,
                         help="Only process first N records (for testing)")
     parser.add_argument("--skip_eval", action="store_true")
     args = parser.parse_args()
 
     print("Building balanced split...", flush=True)
     balanced_records = build_records(args.balanced_dir, args.balanced_captions, args.balanced_csv)
-    if args.subsample:
-        balanced_records = balanced_records[:args.subsample]
+    if args.subsample_train:
+        balanced_records = balanced_records[:args.subsample_train]
     balanced_ds = build_dataset(balanced_records)
     print(f"Balanced split: {len(balanced_ds)} examples", flush=True)
 
     if not args.skip_eval:
         print("Building eval split...", flush=True)
         eval_records = build_records(args.eval_dir, args.eval_captions, args.eval_csv)
-        if args.subsample:
-            eval_records = eval_records[:args.subsample]
+        if args.subsample_eval:
+            eval_records = eval_records[:args.subsample_eval]
         eval_ds = build_dataset(eval_records)
         print(f"Eval split: {len(eval_ds)} examples", flush=True)
 
