@@ -8,8 +8,9 @@ from torch.utils.data import DataLoader
 from transformers import CLIPModel, CLIPProcessor
 from peft import PeftModel
 from sklearn.metrics import average_precision_score
-
-from clasp_dataset import CLASPDataset
+import sys
+sys.path.append(str(Path(__file__).parent.parent))
+from clasp.data.clasp_dataset import CLASPDataset
 
 # ---------------------------------------------------------------------------
 # Config
