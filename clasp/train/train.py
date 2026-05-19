@@ -5,7 +5,7 @@ from transformers import CLIPModel, CLIPProcessor
 from peft import get_peft_model, LoraConfig
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
-from clasp.dataset.clasp_dataset import CLASPDataset
+from data.clasp_dataset import CLASPDataset
 
 # ---------------------------------------------------------------------------
 # Config

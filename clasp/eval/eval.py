@@ -10,7 +10,7 @@ from peft import PeftModel
 from sklearn.metrics import average_precision_score
 import sys
 sys.path.append(str(Path(__file__).parent.parent))
-from clasp.data.clasp_dataset import CLASPDataset
+from data.clasp_dataset import CLASPDataset
 
 # ---------------------------------------------------------------------------
 # Config
