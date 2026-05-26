@@ -58,7 +58,6 @@ packaging==26.2
 pandas==3.0.3
 peft==0.19.1
 pillow==12.2.0
-pip @ file:///home/conda/feedstock_root/build_artifacts/pip_1777924007781/work
 platformdirs==4.9.6
 propcache==0.5.2
 protobuf==7.35.0
