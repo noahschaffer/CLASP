@@ -181,6 +181,11 @@ def recall_at_k(sim_matrix, ks):
 
 
 def evaluate_model(model, data_loader, device, compute_retrieval=False):
+    if len(data_loader) == 0:
+        raise ValueError(
+            "Eval loader is empty. Check the eval split, subsample, and batch size before running eval."
+        )
+
     model.eval()
     total_loss = 0.0
     all_image_embeds = []
