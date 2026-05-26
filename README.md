@@ -130,6 +130,7 @@ When training starts, you should see:
 - `Trainable parameters: ...`: only a small fraction of CLIP should be trainable
 - `batch_loss` and `avg_loss`: contrastive training loss values
 - `epoch_avg_loss`: average loss for the full epoch
+- `pre-train eval global_step 0 ...`: true eval baseline before any updates
 - `eval_avg_loss`: average loss on the `eval` split after each epoch
 - `i2t_r1` and `t2i_r1`: retrieval recall@1 on the eval split
 
@@ -137,6 +138,7 @@ Example log lines:
 
 ```text
 Trainable parameters: 1,234,567 / 150,000,000 (0.82%)
+pre-train eval global_step 0 eval_avg_loss 3.2148 i2t_r1 0.041 t2i_r1 0.038
 epoch 1/10 step 10/32 batch_loss 3.1021 avg_loss 3.2844
 epoch 1/10 complete epoch_avg_loss 3.0419 eval_avg_loss 2.9981 i2t_r1 0.182 t2i_r1 0.176 (first epoch)
 epoch 2/10 complete epoch_avg_loss 2.7315 eval_avg_loss 2.7024 i2t_r1 0.241 t2i_r1 0.233 (down 0.3104 from previous epoch)

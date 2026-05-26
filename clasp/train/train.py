@@ -301,6 +301,65 @@ def train_model(
         metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
         metrics_writer.writeheader()
 
+        if eval_loader is not None:
+            baseline_eval_metrics = evaluate_model(
+                model,
+                eval_loader,
+                device,
+                compute_retrieval=args.eval_retrieval,
+            )
+            baseline_summary = (
+                f"pre-train eval global_step 0 "
+                f"eval_avg_loss {baseline_eval_metrics['eval_avg_loss']:.4f}"
+            )
+            if args.eval_retrieval:
+                baseline_summary += (
+                    f" i2t_r1 {baseline_eval_metrics['eval_i2t_r1']:.3f}"
+                    f" t2i_r1 {baseline_eval_metrics['eval_t2i_r1']:.3f}"
+                )
+            print(baseline_summary, flush=True)
+            metrics_writer.writerow(
+                {
+                    "event": "eval",
+                    "epoch": 0,
+                    "step": 0,
+                    "batch_loss": "",
+                    "running_avg_loss": "",
+                    "epoch_avg_loss": "",
+                    "eval_avg_loss": baseline_eval_metrics.get("eval_avg_loss", ""),
+                    "eval_i2t_r1": baseline_eval_metrics.get("eval_i2t_r1", ""),
+                    "eval_i2t_r5": baseline_eval_metrics.get("eval_i2t_r5", ""),
+                    "eval_i2t_r10": baseline_eval_metrics.get("eval_i2t_r10", ""),
+                    "eval_t2i_r1": baseline_eval_metrics.get("eval_t2i_r1", ""),
+                    "eval_t2i_r5": baseline_eval_metrics.get("eval_t2i_r5", ""),
+                    "eval_t2i_r10": baseline_eval_metrics.get("eval_t2i_r10", ""),
+                    "learning_rate": optimizer.param_groups[0]["lr"],
+                }
+            )
+            metrics_file.flush()
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/global_step": 0,
+                        "train/epoch": 0,
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "eval/epoch_avg_loss": baseline_eval_metrics["eval_avg_loss"],
+                        **(
+                            {
+                                "eval/i2t_r1": baseline_eval_metrics["eval_i2t_r1"],
+                                "eval/i2t_r5": baseline_eval_metrics["eval_i2t_r5"],
+                                "eval/i2t_r10": baseline_eval_metrics["eval_i2t_r10"],
+                                "eval/t2i_r1": baseline_eval_metrics["eval_t2i_r1"],
+                                "eval/t2i_r5": baseline_eval_metrics["eval_t2i_r5"],
+                                "eval/t2i_r10": baseline_eval_metrics["eval_t2i_r10"],
+                            }
+                            if args.eval_retrieval
+                            else {}
+                        ),
+                    }
+                )
+            model.train()
+
         for epoch in range(args.epochs):
             model.train()
             running_loss = 0.0
