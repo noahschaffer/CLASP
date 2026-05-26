@@ -22,11 +22,10 @@ N_FFT = 1024
 HOP_LENGTH = 512
 IMG_SIZE = 224
 
-mel_transform = T.MelSpectrogram(
-    sample_rate=SAMPLE_RATE,
+stft_transform = T.Spectrogram(
     n_fft=N_FFT,
     hop_length=HOP_LENGTH,
-    n_mels=N_MELS,
+    power=2.0,  # power spectrogram (magnitude squared)
 )
 amplitude_to_db = T.AmplitudeToDB(top_db=80)
 
@@ -34,18 +33,15 @@ def audio_to_spectrogram(audio_path, img_size=IMG_SIZE):
     waveform, sr = torchaudio.load(audio_path)
     if sr != SAMPLE_RATE:
         waveform = T.Resample(sr, SAMPLE_RATE)(waveform)
-    waveform = waveform.mean(dim=0, keepdim=True)  # mono, shape (1, T)
+    waveform = waveform.mean(dim=0, keepdim=True)
 
-    mel = mel_transform(waveform)
-    mel_db = amplitude_to_db(mel).squeeze().numpy()  # (n_mels, time)
+    spec = stft_transform(waveform)          # (1, F, T) power spectrogram
+    spec_db = amplitude_to_db(spec).squeeze().numpy()  # log scale in dB
 
-    # Normalize to [0, 1] and flip so low frequencies are at the bottom
-    mel_norm = (mel_db - mel_db.min()) / (mel_db.max() - mel_db.min() + 1e-8)
-    mel_norm = np.flipud(mel_norm)
+    spec_norm = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min() + 1e-8)
+    spec_norm = np.flipud(spec_norm)
 
-    # Apply viridis colormap and convert to uint8 RGB
-    colored = (cm.viridis(mel_norm)[:, :, :3] * 255).astype(np.uint8)
-
+    colored = (cm.viridis(spec_norm)[:, :, :3] * 255).astype(np.uint8)
     return PILImage.fromarray(colored).resize((img_size, img_size), PILImage.BILINEAR)
 
 # ---------------------------------------------------------------------------
@@ -85,6 +81,8 @@ def build_records(audio_dir, captions_json, labels_csv=None):
 
     records = []
     for audio_path in sorted(Path(audio_dir).glob("*.wav")):
+        if "_tmp" in audio_path.stem:
+            continue
         stem = audio_path.stem  # e.g. "--PJHxphWEs_30"
         caption = captions.get(stem)
         if caption is None:
@@ -178,5 +176,5 @@ if __name__ == "__main__":
         ds = balanced_ds
 
     print(f"Pushing to Hub: {args.hub_repo}", flush=True)
-    ds.push_to_hub(args.hub_repo, private=True)
+    ds.push_to_hub(args.hub_repo, private=False)
     print("Done.", flush=True)
