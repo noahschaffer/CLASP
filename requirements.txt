@@ -73,6 +73,7 @@ triton==3.6.0
 typer==0.25.1
 typing-extensions==4.15.0
 urllib3==2.7.0
+wandb>=0.19.0
 wheel==0.47.0
 xxhash==3.7.0
 yarl==1.23.0

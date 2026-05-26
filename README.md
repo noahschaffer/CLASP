@@ -102,6 +102,18 @@ For a quick smoke test:
 python clasp/train/train.py --subsample 8 --epochs 1 --batch_size 2 --num_workers 0
 ```
 
+To log loss curves to Weights & Biases:
+
+```bash
+python clasp/train/train.py --wandb --wandb_project clasp
+```
+
+If you want to avoid uploading metrics while testing, use offline mode:
+
+```bash
+python clasp/train/train.py --wandb --wandb_mode offline
+```
+
 The training script saves the fine-tuned model to `clasp-finetuned/` by default.
 
 ### How to Tell Training Is Working
@@ -131,6 +143,13 @@ The script also writes loss logs to:
 ```text
 clasp-finetuned/train_metrics.csv
 ```
+
+With `--wandb`, it also logs:
+
+- `train/batch_loss`
+- `train/running_avg_loss`
+- `train/epoch_avg_loss`
+- `train/learning_rate`
 
 If the loss becomes `nan`, `inf`, or the epoch average never moves after several
 epochs, stop the run and check the learning rate, batch size, and dataset loading.
