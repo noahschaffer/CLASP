@@ -1,187 +1,549 @@
+"""Evaluate CLASP retrieval and AudioSet multi-label classification.
+
+This script is intentionally close to ``clasp/train/train.py``:
+
+* it uses the same Hugging Face CLIP checkpoint and ``CLIPProcessor``;
+* it reads the same CLASP Hugging Face dataset through ``CLASPDataset``;
+* it can evaluate either frozen CLIP or a LoRA adapter produced by training;
+* it reports the two evaluation families described in the final report:
+  cross-modal retrieval and zero-shot AudioSet classification.
+
+The CLIP model/checkpoint code comes from Hugging Face Transformers. LoRA
+loading, when ``--lora_path`` is provided, uses Hugging Face PEFT. The dataset
+schema is the project dataset at noahschaffer/clasp-audioset-subset.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import sys
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import argparse
-
 from torch.utils.data import DataLoader
 from transformers import CLIPModel, CLIPProcessor
-from peft import PeftModel
-from sklearn.metrics import average_precision_score
-import sys
-sys.path.append(str(Path(__file__).parent.parent))
-from data.clasp_dataset import CLASPDataset
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+# ``clasp/data/clasp_datset.py`` is the dataset file in this repository. The
+# fallback keeps the evaluator compatible if the filename is later corrected.
+CLASP_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(CLASP_ROOT))
+try:
+    from data.clasp_datset import CLASPDataset
+except ModuleNotFoundError:
+    from data.clasp_dataset import CLASPDataset
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_id", default="laion/CLIP-ViT-B-32-laion2B-s34B-b79K")
-    parser.add_argument("--lora_path", default=None,
-                        help="Path to LoRA adapter. If None, evaluates base model.")
-    parser.add_argument("--hub_repo", default="noahschaffer/clasp-audioset")
-    parser.add_argument("--cache_dir", default="")
-    parser.add_argument("--class_labels_csv", default="class_labels_indices.csv")
-    parser.add_argument("--split", default="eval")
-    parser.add_argument("--subsample", type=int, default=None)
+
+DEFAULT_MODEL_ID = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
+DEFAULT_HUB_REPO = "noahschaffer/clasp-audioset-subset"
+DEFAULT_CLASS_LABELS_URL = (
+    "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/"
+    "class_labels_indices.csv"
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate frozen CLIP or a CLASP LoRA adapter on retrieval and "
+            "AudioSet-style multi-label classification."
+        )
+    )
+    parser.add_argument(
+        "--model_id",
+        default=DEFAULT_MODEL_ID,
+        help="Base CLIP checkpoint used by training and evaluation.",
+    )
+    parser.add_argument(
+        "--lora_path",
+        default=None,
+        help=(
+            "Optional path to a PEFT LoRA adapter, e.g. clasp-finetuned. "
+            "If omitted, the frozen base CLIP model is evaluated."
+        ),
+    )
+    parser.add_argument(
+        "--hub_repo",
+        default=DEFAULT_HUB_REPO,
+        help="Hugging Face dataset repo containing image/caption/label rows.",
+    )
+    parser.add_argument(
+        "--split",
+        default="eval",
+        help="Dataset split to evaluate. The project subset uses train/eval.",
+    )
+    parser.add_argument(
+        "--subsample",
+        type=int,
+        default=None,
+        help="Optional first-N slice for quick smoke tests.",
+    )
+    parser.add_argument(
+        "--cache_dir",
+        default=None,
+        help="Optional Hugging Face cache directory for models and dataset.",
+    )
     parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="DataLoader workers. Use 0 for maximum portability on laptops.",
+    )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Override device, e.g. cuda, mps, or cpu. Defaults to auto.",
+    )
+    parser.add_argument(
+        "--class_labels_csv",
+        default=None,
+        help=(
+            "Optional local AudioSet class_labels_indices.csv. If omitted, "
+            "the script tries the official AudioSet URL and then falls back "
+            "to labels observed in the evaluated split."
+        ),
+    )
+    parser.add_argument(
+        "--class_labels_url",
+        default=DEFAULT_CLASS_LABELS_URL,
+        help="Official AudioSet class-label CSV URL used when no CSV is given.",
+    )
+    parser.add_argument(
+        "--label_prompt_template",
+        default="the sound of {}",
+        help="Prompt template used to embed AudioSet class names.",
+    )
+    parser.add_argument(
+        "--output_json",
+        default=None,
+        help="Optional path to write all metrics as JSON.",
+    )
     return parser.parse_args()
 
-# ---------------------------------------------------------------------------
-# Retrieval eval
-# ---------------------------------------------------------------------------
 
-def recall_at_k(sim_matrix, ks):
-    n = sim_matrix.shape[0]
-    ranked = sim_matrix.argsort(dim=-1, descending=True)
-    results = {}
+def select_device(requested: str | None) -> torch.device:
+    if requested is not None:
+        return torch.device(requested)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def collate_clasp_batch(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stack tensor fields while preserving variable-length label lists.
+
+    PyTorch's default collate function expects nested Python lists to have the
+    same length. AudioSet examples are multi-label, so ``label`` has variable
+    length and needs to stay as a list of lists.
+    """
+
+    return {
+        "pixel_values": torch.stack([r["pixel_values"] for r in rows]),
+        "input_ids": torch.stack([r["input_ids"] for r in rows]),
+        "attention_mask": torch.stack([r["attention_mask"] for r in rows]),
+        "label": [r["label"] for r in rows],
+        "ytid": [r["ytid"] for r in rows],
+        "start": [r["start"] for r in rows],
+    }
+
+
+def load_model_and_processor(
+    model_id: str,
+    lora_path: str | None,
+    cache_dir: str | None,
+    device: torch.device,
+) -> tuple[torch.nn.Module, CLIPProcessor]:
+    print(f"Loading CLIP checkpoint: {model_id}", flush=True)
+    processor = CLIPProcessor.from_pretrained(model_id, cache_dir=cache_dir)
+    base_model = CLIPModel.from_pretrained(model_id, cache_dir=cache_dir)
+
+    if lora_path is None:
+        print("Evaluating frozen base CLIP weights.", flush=True)
+        model: torch.nn.Module = base_model
+    else:
+        print(f"Loading PEFT LoRA adapter: {lora_path}", flush=True)
+        try:
+            from peft import PeftModel
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "The --lora_path option requires the peft package. Install the "
+                "same environment used for training before evaluating adapters."
+            ) from exc
+        model = PeftModel.from_pretrained(base_model, lora_path)
+
+    model.to(device)
+    model.eval()
+    return model, processor
+
+
+def feature_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying CLIP model, preserving active PEFT adapters."""
+
+    if hasattr(model, "get_base_model"):
+        return model.get_base_model()
+    return model
+
+
+def feature_tensor(features: Any) -> torch.Tensor:
+    """Extract the projected feature tensor across Transformers versions.
+
+    Some Transformers releases return the projected tensor directly from
+    ``get_image_features``/``get_text_features``. Newer releases return a
+    ``BaseModelOutputWithPooling`` whose ``pooler_output`` has been replaced by
+    the projected CLIP embedding. Supporting both keeps this evaluator usable in
+    the pinned course environment and in newer local environments.
+    """
+
+    if isinstance(features, torch.Tensor):
+        return features
+    if hasattr(features, "pooler_output"):
+        return features.pooler_output
+    if isinstance(features, (tuple, list)) and features:
+        first = features[0]
+        if isinstance(first, torch.Tensor):
+            return first
+    raise TypeError(f"Could not extract feature tensor from {type(features)!r}")
+
+
+@torch.no_grad()
+def encode_label_prompts(
+    model: torch.nn.Module,
+    processor: CLIPProcessor,
+    label_names: list[str],
+    prompt_template: str,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
+    """Embed all AudioSet class prompts once for zero-shot classification."""
+
+    clip_model = feature_model(model)
+    embeds: list[torch.Tensor] = []
+
+    for start in range(0, len(label_names), batch_size):
+        names = label_names[start : start + batch_size]
+        prompts = [prompt_template.format(name.lower()) for name in names]
+        inputs = processor(
+            text=prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(device)
+        text_features = feature_tensor(clip_model.get_text_features(**inputs))
+        embeds.append(F.normalize(text_features, dim=-1).cpu())
+
+    return torch.cat(embeds, dim=0).to(device)
+
+
+@torch.no_grad()
+def encode_eval_split(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, list[list[str]]]:
+    """Encode spectrograms and captions in dataset order.
+
+    Retrieval assumes row i's spectrogram is paired with row i's caption, so the
+    dataloader must not shuffle. Classification reuses the image embeddings.
+    """
+
+    clip_model = feature_model(model)
+    image_embeds: list[torch.Tensor] = []
+    text_embeds: list[torch.Tensor] = []
+    label_rows: list[list[str]] = []
+
+    for step, batch in enumerate(loader, start=1):
+        pixel_values = batch["pixel_values"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+
+        image_features = feature_tensor(
+            clip_model.get_image_features(pixel_values=pixel_values)
+        )
+        text_features = feature_tensor(
+            clip_model.get_text_features(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+        )
+
+        image_embeds.append(F.normalize(image_features, dim=-1).cpu())
+        text_embeds.append(F.normalize(text_features, dim=-1).cpu())
+        label_rows.extend(clean_label_list(labels) for labels in batch["label"])
+
+        if step == 1 or step % 10 == 0 or step == len(loader):
+            print(f"Encoded batch {step}/{len(loader)}", flush=True)
+
+    return torch.cat(image_embeds), torch.cat(text_embeds), label_rows
+
+
+def clean_label_list(labels: Any) -> list[str]:
+    """Normalize a dataset label field into a list of AudioSet MID strings."""
+
+    if labels is None:
+        return []
+    if isinstance(labels, str):
+        labels = [labels]
+    return [str(label).strip().strip('"') for label in labels if str(label).strip()]
+
+
+def retrieval_metrics(similarity: torch.Tensor, ks: tuple[int, ...]) -> dict[str, float]:
+    """Compute CLIP-style Recall@K and rank statistics for paired rows."""
+
+    n_queries = similarity.shape[0]
+    ranked = similarity.argsort(dim=1, descending=True)
+    target = torch.arange(n_queries).unsqueeze(1)
+    matches = ranked.eq(target)
+    ranks = matches.float().argmax(dim=1) + 1
+
+    metrics: dict[str, float] = {}
     for k in ks:
-        correct = (
-            ranked[:, :k] == torch.arange(n, device=ranked.device).unsqueeze(1)
-        ).any(dim=1)
-        results[f"R@{k}"] = correct.float().mean().item()
-    return results
+        metrics[f"R@{k}"] = matches[:, :k].any(dim=1).float().mean().item()
+    metrics["median_rank"] = ranks.float().median().item()
+    metrics["mean_rank"] = ranks.float().mean().item()
+    return metrics
 
-def evaluate_retrieval(all_image_embeds, all_text_embeds):
-    image_embeds = torch.cat(all_image_embeds)
-    text_embeds = torch.cat(all_text_embeds)
-    sim = image_embeds @ text_embeds.T
 
+def evaluate_retrieval(
+    image_embeds: torch.Tensor,
+    text_embeds: torch.Tensor,
+    ks: tuple[int, ...] = (1, 5, 10),
+) -> dict[str, dict[str, float]]:
+    """Evaluate spectrogram-caption retrieval in both directions."""
+
+    similarity = image_embeds @ text_embeds.T
     return {
-        "image_to_text": recall_at_k(sim, [1, 5, 10]),
-        "text_to_image": recall_at_k(sim.T, [1, 5, 10]),
+        "spectrogram_to_text": retrieval_metrics(similarity, ks),
+        "text_to_spectrogram": retrieval_metrics(similarity.T, ks),
     }
 
-# ---------------------------------------------------------------------------
-# Classification eval
-# ---------------------------------------------------------------------------
 
-def build_label_embeddings(model, processor, df, device):
-    prompts = [f"the sound of {name.lower()}" for name in df["display_name"]]
-    inputs = processor(
-        text=prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-    ).to(device)
-    with torch.no_grad():
-        text_embeds = F.normalize(model.get_text_features(**inputs), dim=-1)
-    return text_embeds
+def parse_class_label_rows(handle: Any) -> list[dict[str, str]]:
+    """Parse AudioSet class_labels_indices.csv into normalized dictionaries."""
 
-def evaluate_classification(all_scores, all_targets, n_classes):
-    scores = np.vstack(all_scores)   # (N, n_classes)
-    targets = np.vstack(all_targets) # (N, n_classes)
+    reader = csv.DictReader(handle)
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        mid = (row.get("mid") or "").strip()
+        display_name = (row.get("display_name") or mid).strip()
+        if mid:
+            rows.append({"mid": mid, "display_name": display_name})
+    return rows
 
-    class_ap = []
-    for c in range(n_classes):
-        if targets[:, c].sum() > 0:
-            ap = average_precision_score(targets[:, c], scores[:, c])
+
+def observed_label_rows(label_rows: list[list[str]]) -> list[dict[str, str]]:
+    """Fallback label table when the official AudioSet class CSV is unavailable."""
+
+    observed = sorted({mid for labels in label_rows for mid in labels})
+    return [{"mid": mid, "display_name": mid} for mid in observed]
+
+
+def load_class_labels(
+    class_labels_csv: str | None,
+    class_labels_url: str | None,
+    label_rows: list[list[str]],
+) -> tuple[list[dict[str, str]], str]:
+    """Load 527 AudioSet labels, falling back to observed labels if needed."""
+
+    if class_labels_csv is not None:
+        path = Path(class_labels_csv)
+        with path.open(newline="") as handle:
+            rows = parse_class_label_rows(handle)
+        return rows, str(path)
+
+    if class_labels_url:
+        try:
+            with urllib.request.urlopen(class_labels_url, timeout=30) as response:
+                text = response.read().decode("utf-8")
+            rows = parse_class_label_rows(io.StringIO(text))
+            return rows, class_labels_url
+        except Exception as exc:  # noqa: BLE001 - print reason and use fallback.
+            print(
+                "Could not load official AudioSet class labels; falling back "
+                f"to labels observed in this split. Reason: {exc}",
+                flush=True,
+            )
+
+    rows = observed_label_rows(label_rows)
+    return rows, "observed labels in evaluated split"
+
+
+def average_precision_binary(target: np.ndarray, score: np.ndarray) -> float | None:
+    """Compute average precision for one binary class without sklearn.
+
+    AudioSet classification is multi-label. We score each class independently
+    and then average AP across classes that have at least one positive example
+    in the evaluated split.
+    """
+
+    positives = int(target.sum())
+    if positives == 0:
+        return None
+
+    order = np.argsort(-score, kind="mergesort")
+    sorted_target = target[order]
+    tp_cumsum = np.cumsum(sorted_target)
+    ranks = np.arange(1, len(sorted_target) + 1)
+    precision_at_hits = (tp_cumsum / ranks) * sorted_target
+    return float(precision_at_hits.sum() / positives)
+
+
+def evaluate_classification(
+    image_embeds: torch.Tensor,
+    label_embeds: torch.Tensor,
+    label_rows: list[list[str]],
+    class_rows: list[dict[str, str]],
+) -> dict[str, Any]:
+    """Compute zero-shot multi-label classification mAP over AudioSet labels."""
+
+    mid_to_idx = {row["mid"]: idx for idx, row in enumerate(class_rows)}
+    targets = np.zeros((len(label_rows), len(class_rows)), dtype=np.float32)
+
+    for row_idx, labels in enumerate(label_rows):
+        for mid in labels:
+            class_idx = mid_to_idx.get(mid)
+            if class_idx is not None:
+                targets[row_idx, class_idx] = 1.0
+
+    scores = (image_embeds @ label_embeds.cpu().T).numpy()
+    class_ap: list[float] = []
+    evaluated_mids: list[str] = []
+
+    for class_idx, class_row in enumerate(class_rows):
+        ap = average_precision_binary(targets[:, class_idx], scores[:, class_idx])
+        if ap is not None:
             class_ap.append(ap)
+            evaluated_mids.append(class_row["mid"])
 
     return {
-        "mAP": np.mean(class_ap),
+        "mAP": float(np.mean(class_ap)) if class_ap else float("nan"),
+        "n_classes_total": len(class_rows),
         "n_classes_evaluated": len(class_ap),
+        "n_examples": len(label_rows),
+        "evaluated_mids": evaluated_mids,
     }
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
-def main():
+def print_retrieval_block(title: str, metrics: dict[str, float]) -> None:
+    print(
+        f"{title} | "
+        f"R@1: {metrics['R@1']:.3f}  "
+        f"R@5: {metrics['R@5']:.3f}  "
+        f"R@10: {metrics['R@10']:.3f}  "
+        f"MedR: {metrics['median_rank']:.1f}  "
+        f"MeanR: {metrics['mean_rank']:.1f}",
+        flush=True,
+    )
+
+
+def main() -> None:
     args = parse_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = select_device(args.device)
     print(f"Using device: {device}", flush=True)
 
-    # Load model
-    print(f"Loading model {args.model_id}...", flush=True)
-    processor = CLIPProcessor.from_pretrained(args.model_id)
-    base_model = CLIPModel.from_pretrained(args.model_id).to(device)
+    model, processor = load_model_and_processor(
+        model_id=args.model_id,
+        lora_path=args.lora_path,
+        cache_dir=args.cache_dir,
+        device=device,
+    )
 
-    if args.lora_path is not None:
-        print(f"Loading LoRA adapter from {args.lora_path}...", flush=True)
-        model = PeftModel.from_pretrained(base_model, args.lora_path)
-    else:
-        print("Evaluating base model (no LoRA).", flush=True)
-        model = base_model
-
-    model.eval()
-
-    # Load dataset
-    ds = CLASPDataset(
+    print(
+        f"Loading dataset {args.hub_repo} split={args.split} "
+        f"subsample={args.subsample}",
+        flush=True,
+    )
+    dataset = CLASPDataset(
         args.hub_repo,
         processor,
         split=args.split,
         subsample=args.subsample,
         cache_dir=args.cache_dir,
     )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=4)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_clasp_batch,
+    )
 
-    # Load AudioSet class labels
-    df = pd.read_csv(args.class_labels_csv)
-    mid_to_idx = {mid: i for i, mid in enumerate(df["mid"])}
-    n_classes = len(df)
+    print(f"Encoding {len(dataset)} examples...", flush=True)
+    image_embeds, text_embeds, label_rows = encode_eval_split(model, loader, device)
 
-    # Pre-compute label embeddings for classification
-    print("Building label embeddings...", flush=True)
-    label_embeds = build_label_embeddings(model, processor, df, device)
+    print("Evaluating retrieval...", flush=True)
+    retrieval = evaluate_retrieval(image_embeds, text_embeds)
 
-    # Eval loop
-    all_image_embeds = []
-    all_text_embeds = []
-    all_scores = []
-    all_targets = []
+    class_rows, class_label_source = load_class_labels(
+        args.class_labels_csv,
+        args.class_labels_url,
+        label_rows,
+    )
+    label_names = [row["display_name"] for row in class_rows]
+    print(
+        f"Embedding {len(label_names)} class prompts from {class_label_source}...",
+        flush=True,
+    )
+    label_embeds = encode_label_prompts(
+        model,
+        processor,
+        label_names,
+        args.label_prompt_template,
+        device,
+        args.batch_size,
+    )
 
-    print(f"Evaluating {len(ds)} clips...", flush=True)
-    with torch.no_grad():
-        for i, batch in enumerate(loader):
-            pixel_values = batch["pixel_values"].to(device)
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["label"]  # list of list of MID strings
+    print("Evaluating zero-shot multi-label classification...", flush=True)
+    classification = evaluate_classification(
+        image_embeds,
+        label_embeds,
+        label_rows,
+        class_rows,
+    )
 
-            outputs = model(
-                pixel_values=pixel_values,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            )
-
-            # Retrieval
-            all_image_embeds.append(F.normalize(outputs.image_embeds, dim=-1))
-            all_text_embeds.append(F.normalize(outputs.text_embeds, dim=-1))
-
-            # Classification
-            image_embeds = F.normalize(outputs.image_embeds, dim=-1)
-            sim = (image_embeds @ label_embeds.T).cpu().numpy()
-            all_scores.append(sim)
-
-            batch_targets = np.zeros((len(labels), n_classes))
-            for j, clip_labels in enumerate(labels):
-                for mid in clip_labels:
-                    mid = mid.strip().strip('"')
-                    if mid in mid_to_idx:
-                        batch_targets[j, mid_to_idx[mid]] = 1
-            all_targets.append(batch_targets)
-
-            if i % 10 == 0:
-                print(f"[{i}/{len(loader)}]", flush=True)
-
-    # Retrieval results
-    retrieval = evaluate_retrieval(all_image_embeds, all_text_embeds)
-    i2t = retrieval["image_to_text"]
-    t2i = retrieval["text_to_image"]
-
-    # Classification results
-    classification = evaluate_classification(all_scores, all_targets, n_classes)
-
-    # Print results
     print("\n--- Retrieval ---", flush=True)
-    print(f"Image → Text | R@1: {i2t['R@1']:.3f}  R@5: {i2t['R@5']:.3f}  R@10: {i2t['R@10']:.3f}", flush=True)
-    print(f"Text → Image | R@1: {t2i['R@1']:.3f}  R@5: {t2i['R@5']:.3f}  R@10: {t2i['R@10']:.3f}", flush=True)
+    print_retrieval_block(
+        "Spectrogram -> Text",
+        retrieval["spectrogram_to_text"],
+    )
+    print_retrieval_block(
+        "Text -> Spectrogram",
+        retrieval["text_to_spectrogram"],
+    )
 
     print("\n--- Classification ---", flush=True)
-    print(f"mAP: {classification['mAP']:.4f}  (over {classification['n_classes_evaluated']} classes)", flush=True)
+    print(
+        f"mAP: {classification['mAP']:.4f} "
+        f"(over {classification['n_classes_evaluated']} classes with positives; "
+        f"{classification['n_classes_total']} prompts total)",
+        flush=True,
+    )
+
+    metrics = {
+        "model_id": args.model_id,
+        "lora_path": args.lora_path,
+        "hub_repo": args.hub_repo,
+        "split": args.split,
+        "n_examples": len(dataset),
+        "class_label_source": class_label_source,
+        "retrieval": retrieval,
+        "classification": classification,
+    }
+
+    if args.output_json is not None:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(f"\nWrote metrics to {output_path}", flush=True)
+
 
 if __name__ == "__main__":
     main()
