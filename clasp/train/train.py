@@ -24,7 +24,14 @@ DEFAULT_CACHE_DIR = "data/hf_cache"
 DEFAULT_DATASET_DIR = "data/clasp-audioset-subset"
 
 
-def parse_args():
+def non_negative_int(value):
+    parsed_value = int(value)
+    if parsed_value < 0:
+        raise argparse.ArgumentTypeError("Expected a non-negative integer.")
+    return parsed_value
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fine-tune CLIP on CLASP data with LoRA.")
     parser.add_argument("--model_id", default=MODEL_ID)
     parser.add_argument("--hub_repo", default=DEFAULT_HUB_REPO)
@@ -44,13 +51,18 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument(
+        "--log_every",
+        type=non_negative_int,
+        default=10,
+        help="Log step metrics every N batches. Set to 0 to disable step-level logging.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_targets", nargs="+", default=["q_proj", "v_proj"])
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def set_seed(seed):
@@ -224,7 +236,8 @@ def main():
                 running_loss += batch_loss
                 running_avg_loss = running_loss / step
 
-                if step % args.log_every == 0 or step == len(train_loader):
+                should_log_step = args.log_every > 0 and step % args.log_every == 0
+                if should_log_step or (args.log_every > 0 and step == len(train_loader)):
                     print(
                         f"epoch {epoch + 1}/{args.epochs} "
                         f"step {step}/{len(train_loader)} "
