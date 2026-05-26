@@ -29,6 +29,19 @@ MANIFEST
 logs/
 sbatch/
 
+# CLASP local data and model artifacts
+/data/
+/clasp-finetuned/
+/outputs/
+/runs/
+/wandb/
+
+# Raw AudioSet pipeline outputs
+/audioset_balanced/
+/audioset_eval/
+/captions_balanced.json
+/captions_eval.json
+
 # PyInstaller
 #   Usually these files are written by a python script from a template
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -219,3 +232,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI agent tools
+.serena/
