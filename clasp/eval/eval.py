@@ -35,9 +35,9 @@ from transformers import CLIPModel, CLIPProcessor
 CLASP_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(CLASP_ROOT))
 try:
-    from data.clasp_dataset import CLASPDataset
-except ModuleNotFoundError:
     from data.clasp_datset import CLASPDataset
+except ModuleNotFoundError:
+    from data.clasp_dataset import CLASPDataset
 
 
 DEFAULT_MODEL_ID = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
