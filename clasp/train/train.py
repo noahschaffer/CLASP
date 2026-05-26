@@ -221,6 +221,148 @@ def init_wandb(args, output_dir, device, total_params, trainable_params, steps_p
     return run
 
 
+def train_model(
+    model,
+    train_loader,
+    eval_loader,
+    optimizer,
+    args,
+    device,
+    metrics_path,
+    wandb_run,
+):
+    metrics_fields = [
+        "event",
+        "epoch",
+        "step",
+        "batch_loss",
+        "running_avg_loss",
+        "epoch_avg_loss",
+        "eval_avg_loss",
+        "learning_rate",
+    ]
+    previous_epoch_loss = None
+
+    with metrics_path.open("w", newline="") as metrics_file:
+        metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
+        metrics_writer.writeheader()
+
+        for epoch in range(args.epochs):
+            model.train()
+            running_loss = 0.0
+
+            for step, batch in enumerate(train_loader, start=1):
+                pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+
+                outputs = model(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                )
+                loss = contrastive_loss(outputs.logits_per_image)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite loss at epoch {epoch + 1}, step {step}: {loss.item()}"
+                    )
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [param for param in model.parameters() if param.requires_grad],
+                        args.max_grad_norm,
+                    )
+                optimizer.step()
+
+                batch_loss = loss.item()
+                running_loss += batch_loss
+                running_avg_loss = running_loss / step
+                global_step = epoch * len(train_loader) + step
+                learning_rate = optimizer.param_groups[0]["lr"]
+
+                if wandb_run is not None:
+                    wandb_run.log(
+                        {
+                            "train/global_step": global_step,
+                            "train/epoch": epoch + 1,
+                            "train/batch_loss": batch_loss,
+                            "train/running_avg_loss": running_avg_loss,
+                            "train/learning_rate": learning_rate,
+                        }
+                    )
+
+                should_log_step = args.log_every > 0 and step % args.log_every == 0
+                if should_log_step or (args.log_every > 0 and step == len(train_loader)):
+                    print(
+                        f"epoch {epoch + 1}/{args.epochs} "
+                        f"step {step}/{len(train_loader)} "
+                        f"batch_loss {batch_loss:.4f} "
+                        f"avg_loss {running_avg_loss:.4f}",
+                        flush=True,
+                    )
+                    metrics_writer.writerow(
+                        {
+                            "event": "step",
+                            "epoch": epoch + 1,
+                            "step": step,
+                            "batch_loss": batch_loss,
+                            "running_avg_loss": running_avg_loss,
+                            "epoch_avg_loss": "",
+                            "eval_avg_loss": "",
+                            "learning_rate": learning_rate,
+                        }
+                    )
+                    metrics_file.flush()
+
+            epoch_loss = running_loss / len(train_loader)
+            if previous_epoch_loss is None:
+                change_text = "first epoch"
+            else:
+                delta = epoch_loss - previous_epoch_loss
+                direction = "down" if delta < 0 else "up"
+                change_text = f"{direction} {abs(delta):.4f} from previous epoch"
+
+            eval_loss = None
+            if eval_loader is not None:
+                eval_loss = evaluate_loss(model, eval_loader, device)
+                model.train()
+
+            epoch_summary = (
+                f"epoch {epoch + 1}/{args.epochs} complete "
+                f"epoch_avg_loss {epoch_loss:.4f}"
+            )
+            if eval_loss is not None:
+                epoch_summary += f" eval_avg_loss {eval_loss:.4f}"
+            epoch_summary += f" ({change_text})"
+            print(epoch_summary, flush=True)
+            metrics_writer.writerow(
+                {
+                    "event": "epoch",
+                    "epoch": epoch + 1,
+                    "step": len(train_loader),
+                    "batch_loss": "",
+                    "running_avg_loss": "",
+                    "epoch_avg_loss": epoch_loss,
+                    "eval_avg_loss": "" if eval_loss is None else eval_loss,
+                    "learning_rate": learning_rate,
+                }
+            )
+            metrics_file.flush()
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "train/global_step": (epoch + 1) * len(train_loader),
+                        "train/epoch": epoch + 1,
+                        "train/epoch_avg_loss": epoch_loss,
+                        "train/learning_rate": learning_rate,
+                        **({"eval/epoch_avg_loss": eval_loss} if eval_loss is not None else {}),
+                    }
+                )
+            previous_epoch_loss = epoch_loss
+
+
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -303,18 +445,6 @@ def main():
             f"in {args.wandb_mode} mode.",
             flush=True,
         )
-
-    metrics_fields = [
-        "event",
-        "epoch",
-        "step",
-        "batch_loss",
-        "running_avg_loss",
-        "epoch_avg_loss",
-        "eval_avg_loss",
-        "learning_rate",
-    ]
-    previous_epoch_loss = None
     wandb_run = init_wandb(
         args,
         output_dir=output_dir,
@@ -325,127 +455,16 @@ def main():
     )
 
     try:
-        with metrics_path.open("w", newline="") as metrics_file:
-            metrics_writer = csv.DictWriter(metrics_file, fieldnames=metrics_fields)
-            metrics_writer.writeheader()
-
-            for epoch in range(args.epochs):
-                model.train()
-                running_loss = 0.0
-
-                for step, batch in enumerate(train_loader, start=1):
-                    pixel_values = batch["pixel_values"].to(device, non_blocking=True)
-                    input_ids = batch["input_ids"].to(device, non_blocking=True)
-                    attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-
-                    outputs = model(
-                        pixel_values=pixel_values,
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                    )
-                    loss = contrastive_loss(outputs.logits_per_image)
-                    if not torch.isfinite(loss):
-                        raise RuntimeError(
-                            f"Non-finite loss at epoch {epoch + 1}, step {step}: {loss.item()}"
-                        )
-
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            [param for param in model.parameters() if param.requires_grad],
-                            args.max_grad_norm,
-                        )
-                    optimizer.step()
-
-                    batch_loss = loss.item()
-                    running_loss += batch_loss
-                    running_avg_loss = running_loss / step
-                    global_step = epoch * len(train_loader) + step
-                    learning_rate = optimizer.param_groups[0]["lr"]
-
-                    if wandb_run is not None:
-                        wandb_run.log(
-                            {
-                                "train/global_step": global_step,
-                                "train/epoch": epoch + 1,
-                                "train/batch_loss": batch_loss,
-                                "train/running_avg_loss": running_avg_loss,
-                                "train/learning_rate": learning_rate,
-                            }
-                        )
-
-                    should_log_step = args.log_every > 0 and step % args.log_every == 0
-                    if should_log_step or (args.log_every > 0 and step == len(train_loader)):
-                        print(
-                            f"epoch {epoch + 1}/{args.epochs} "
-                            f"step {step}/{len(train_loader)} "
-                            f"batch_loss {batch_loss:.4f} "
-                            f"avg_loss {running_avg_loss:.4f}",
-                            flush=True,
-                        )
-                        metrics_writer.writerow(
-                            {
-                                "event": "step",
-                                "epoch": epoch + 1,
-                                "step": step,
-                                "batch_loss": batch_loss,
-                                "running_avg_loss": running_avg_loss,
-                                "epoch_avg_loss": "",
-                                "learning_rate": learning_rate,
-                            }
-                        )
-                        metrics_file.flush()
-
-                epoch_loss = running_loss / len(train_loader)
-                if previous_epoch_loss is None:
-                    change_text = "first epoch"
-                else:
-                    delta = epoch_loss - previous_epoch_loss
-                    direction = "down" if delta < 0 else "up"
-                    change_text = f"{direction} {abs(delta):.4f} from previous epoch"
-
-                eval_loss = None
-                if eval_loader is not None:
-                    eval_loss = evaluate_loss(model, eval_loader, device)
-                    model.train()
-
-                epoch_summary = (
-                    f"epoch {epoch + 1}/{args.epochs} complete "
-                    f"epoch_avg_loss {epoch_loss:.4f}"
-                )
-                if eval_loss is not None:
-                    epoch_summary += f" eval_avg_loss {eval_loss:.4f}"
-                epoch_summary += f" ({change_text})"
-                print(epoch_summary, flush=True)
-                metrics_writer.writerow(
-                    {
-                        "event": "epoch",
-                        "epoch": epoch + 1,
-                        "step": len(train_loader),
-                        "batch_loss": "",
-                        "running_avg_loss": "",
-                        "epoch_avg_loss": epoch_loss,
-                        "eval_avg_loss": "" if eval_loss is None else eval_loss,
-                        "learning_rate": learning_rate,
-                    }
-                )
-                metrics_file.flush()
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "train/global_step": (epoch + 1) * len(train_loader),
-                            "train/epoch": epoch + 1,
-                            "train/epoch_avg_loss": epoch_loss,
-                            "train/learning_rate": learning_rate,
-                            **(
-                                {"eval/epoch_avg_loss": eval_loss}
-                                if eval_loss is not None
-                                else {}
-                            ),
-                        }
-                    )
-                previous_epoch_loss = epoch_loss
+        train_model(
+            model=model,
+            train_loader=train_loader,
+            eval_loader=eval_loader,
+            optimizer=optimizer,
+            args=args,
+            device=device,
+            metrics_path=metrics_path,
+            wandb_run=wandb_run,
+        )
     finally:
         if wandb_run is not None:
             wandb_run.finish()
