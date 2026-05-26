@@ -18,7 +18,19 @@ uv pip sync requirements.txt
 ## Generating paired spectrogram/caption data
 
 ### Audio Flamingo Captioning
-
+To generate captions with AudioFlamingo, run the script 
+```bash
+clasp/data/build_dataset.py
+```
+Important arguments:
+- `--balanced_dir`
+  Location of the AudioSet balanced dataset
+- `--eval_dir`
+  Location of the AudioSet eval dataset
+- `--balanced_out`
+  Location to write the caption json for AudioSet balanced
+- `--eval_out`
+  Location to write the caption json for AudioSet eval
 ### CLASP HF dataset
 
 ### CLASP DataLoader
