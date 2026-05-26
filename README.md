@@ -130,19 +130,26 @@ When training starts, you should see:
 - `Trainable parameters: ...`: only a small fraction of CLIP should be trainable
 - `batch_loss` and `avg_loss`: contrastive training loss values
 - `epoch_avg_loss`: average loss for the full epoch
+- `eval_avg_loss`: average loss on the `eval` split after each epoch
 
 Example log lines:
 
 ```text
 Trainable parameters: 1,234,567 / 150,000,000 (0.82%)
 epoch 1/10 step 10/32 batch_loss 3.1021 avg_loss 3.2844
-epoch 1/10 complete epoch_avg_loss 3.0419 (first epoch)
-epoch 2/10 complete epoch_avg_loss 2.7315 (down 0.3104 from previous epoch)
+epoch 1/10 complete epoch_avg_loss 3.0419 eval_avg_loss 2.9981 (first epoch)
+epoch 2/10 complete epoch_avg_loss 2.7315 eval_avg_loss 2.7024 (down 0.3104 from previous epoch)
 ```
 
 Lower loss is better. Step-level `batch_loss` can bounce around, so judge progress
-mainly by `epoch_avg_loss`. A random contrastive baseline is roughly
+mainly by `epoch_avg_loss` and `eval_avg_loss`. A random contrastive baseline is roughly
 `ln(batch_size)`, so with the default batch size of `32` it is about `3.47`.
+
+Training evaluates on the `eval` split by default at the end of each epoch. To disable this:
+
+```bash
+python clasp/train/train.py --eval_split none
+```
 
 The script also writes loss logs to:
 
@@ -156,6 +163,7 @@ With `--wandb`, it also logs:
 - `train/running_avg_loss`
 - `train/epoch_avg_loss`
 - `train/learning_rate`
+- `eval/epoch_avg_loss`
 
 If the loss becomes `nan`, `inf`, or the epoch average never moves after several
 epochs, stop the run and check the learning rate, batch size, and dataset loading.

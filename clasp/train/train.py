@@ -30,6 +30,10 @@ def non_negative_int(value):
     return parsed_value
 
 
+def optional_string(value):
+    return None if value in (None, "", "none", "None") else value
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fine-tune CLIP on CLASP data with LoRA.")
     parser.add_argument("--model_id", default=MODEL_ID)
@@ -50,6 +54,15 @@ def parse_args(argv=None):
     parser.add_argument("--subsample", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument(
+        "--eval_split",
+        type=optional_string,
+        default="eval",
+        help="Optional split to evaluate at the end of each epoch. Set to none to disable.",
+    )
+    parser.add_argument("--eval_subsample", type=int, default=None)
+    parser.add_argument("--eval_batch_size", type=int, default=None)
+    parser.add_argument("--eval_num_workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
@@ -149,6 +162,29 @@ def count_parameters(model):
     return total, trainable
 
 
+def evaluate_loss(model, data_loader, device):
+    model.eval()
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for batch in data_loader:
+            pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+
+            outputs = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+            loss = contrastive_loss(outputs.logits_per_image)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite eval loss: {loss.item()}")
+            total_loss += loss.item()
+
+    return total_loss / len(data_loader)
+
+
 def init_wandb(args, output_dir, device, total_params, trainable_params, steps_per_epoch):
     if not args.wandb:
         return None
@@ -179,6 +215,7 @@ def init_wandb(args, output_dir, device, total_params, trainable_params, steps_p
         "train/epoch_avg_loss",
         "train/learning_rate",
         "train/epoch",
+        "eval/epoch_avg_loss",
     ):
         wandb.define_metric(metric_name, step_metric="train/global_step")
     return run
@@ -225,6 +262,24 @@ def main():
         pin_memory=device.type == "cuda",
         collate_fn=collate_clasp_batch,
     )
+    eval_loader = None
+    if args.eval_split is not None:
+        eval_ds = CLASPDataset(
+            hub_repo=args.hub_repo,
+            processor=processor,
+            split=args.eval_split,
+            subsample=args.eval_subsample,
+            cache_dir=args.cache_dir,
+            dataset_dir=dataset_dir,
+        )
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.eval_batch_size or args.batch_size,
+            shuffle=False,
+            num_workers=args.eval_num_workers,
+            pin_memory=device.type == "cuda",
+            collate_fn=collate_clasp_batch,
+        )
 
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
@@ -256,6 +311,7 @@ def main():
         "batch_loss",
         "running_avg_loss",
         "epoch_avg_loss",
+        "eval_avg_loss",
         "learning_rate",
     ]
     previous_epoch_loss = None
@@ -349,11 +405,19 @@ def main():
                     direction = "down" if delta < 0 else "up"
                     change_text = f"{direction} {abs(delta):.4f} from previous epoch"
 
-                print(
+                eval_loss = None
+                if eval_loader is not None:
+                    eval_loss = evaluate_loss(model, eval_loader, device)
+                    model.train()
+
+                epoch_summary = (
                     f"epoch {epoch + 1}/{args.epochs} complete "
-                    f"epoch_avg_loss {epoch_loss:.4f} ({change_text})",
-                    flush=True,
+                    f"epoch_avg_loss {epoch_loss:.4f}"
                 )
+                if eval_loss is not None:
+                    epoch_summary += f" eval_avg_loss {eval_loss:.4f}"
+                epoch_summary += f" ({change_text})"
+                print(epoch_summary, flush=True)
                 metrics_writer.writerow(
                     {
                         "event": "epoch",
@@ -362,6 +426,7 @@ def main():
                         "batch_loss": "",
                         "running_avg_loss": "",
                         "epoch_avg_loss": epoch_loss,
+                        "eval_avg_loss": "" if eval_loss is None else eval_loss,
                         "learning_rate": learning_rate,
                     }
                 )
@@ -373,6 +438,11 @@ def main():
                             "train/epoch": epoch + 1,
                             "train/epoch_avg_loss": epoch_loss,
                             "train/learning_rate": learning_rate,
+                            **(
+                                {"eval/epoch_avg_loss": eval_loss}
+                                if eval_loss is not None
+                                else {}
+                            ),
                         }
                     )
                 previous_epoch_loss = epoch_loss
