@@ -96,6 +96,12 @@ After downloading the dataset, run LoRA fine-tuning:
 python clasp/train/train.py
 ```
 
+If you saved a local dataset copy with `python scripts/download_clasp_dataset.py`, point training at it with:
+
+```bash
+python clasp/train/train.py --dataset_dir data/clasp-audioset-subset
+```
+
 For a quick smoke test:
 
 ```bash

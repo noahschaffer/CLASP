@@ -21,7 +21,6 @@ from data.clasp_dataset import (  # noqa: E402
 
 MODEL_ID = "laion/CLIP-ViT-B-32-laion2B-s34B-b79K"
 DEFAULT_CACHE_DIR = "data/hf_cache"
-DEFAULT_DATASET_DIR = "data/clasp-audioset-subset"
 
 
 def non_negative_int(value):
@@ -35,7 +34,11 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Fine-tune CLIP on CLASP data with LoRA.")
     parser.add_argument("--model_id", default=MODEL_ID)
     parser.add_argument("--hub_repo", default=DEFAULT_HUB_REPO)
-    parser.add_argument("--dataset_dir", default=DEFAULT_DATASET_DIR)
+    parser.add_argument(
+        "--dataset_dir",
+        default=None,
+        help="Optional path to a local Hugging Face dataset saved with save_to_disk().",
+    )
     parser.add_argument("--cache_dir", default=DEFAULT_CACHE_DIR)
     parser.add_argument("--output_dir", default="clasp-finetuned")
     parser.add_argument(
@@ -198,12 +201,13 @@ def main():
         flush=True,
     )
 
-    dataset_dir = args.dataset_dir if Path(args.dataset_dir).exists() else None
-    if dataset_dir is None:
+    dataset_dir = Path(args.dataset_dir) if args.dataset_dir else None
+    if dataset_dir is not None and not dataset_dir.exists():
         print(
             f"Local dataset not found at {args.dataset_dir}; loading from Hugging Face.",
             flush=True,
         )
+        dataset_dir = None
 
     train_ds = CLASPDataset(
         hub_repo=args.hub_repo,
