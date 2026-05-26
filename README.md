@@ -131,24 +131,31 @@ When training starts, you should see:
 - `batch_loss` and `avg_loss`: contrastive training loss values
 - `epoch_avg_loss`: average loss for the full epoch
 - `eval_avg_loss`: average loss on the `eval` split after each epoch
+- `i2t_r1` and `t2i_r1`: retrieval recall@1 on the eval split
 
 Example log lines:
 
 ```text
 Trainable parameters: 1,234,567 / 150,000,000 (0.82%)
 epoch 1/10 step 10/32 batch_loss 3.1021 avg_loss 3.2844
-epoch 1/10 complete epoch_avg_loss 3.0419 eval_avg_loss 2.9981 (first epoch)
-epoch 2/10 complete epoch_avg_loss 2.7315 eval_avg_loss 2.7024 (down 0.3104 from previous epoch)
+epoch 1/10 complete epoch_avg_loss 3.0419 eval_avg_loss 2.9981 i2t_r1 0.182 t2i_r1 0.176 (first epoch)
+epoch 2/10 complete epoch_avg_loss 2.7315 eval_avg_loss 2.7024 i2t_r1 0.241 t2i_r1 0.233 (down 0.3104 from previous epoch)
 ```
 
 Lower loss is better. Step-level `batch_loss` can bounce around, so judge progress
-mainly by `epoch_avg_loss` and `eval_avg_loss`. A random contrastive baseline is roughly
+mainly by `eval_avg_loss` plus retrieval metrics like `i2t_r1` and `t2i_r1`. A random contrastive baseline is roughly
 `ln(batch_size)`, so with the default batch size of `32` it is about `3.47`.
 
-Training evaluates on the `eval` split by default at the end of each epoch. To disable this:
+Training evaluates on the `eval` split by default at the end of each epoch. To disable eval entirely:
 
 ```bash
 python clasp/train/train.py --eval_split none
+```
+
+To keep eval loss but skip retrieval metrics:
+
+```bash
+python clasp/train/train.py --no-eval_retrieval
 ```
 
 The script also writes loss logs to:
@@ -164,6 +171,8 @@ With `--wandb`, it also logs:
 - `train/epoch_avg_loss`
 - `train/learning_rate`
 - `eval/epoch_avg_loss`
+- `eval/i2t_r1`, `eval/i2t_r5`, `eval/i2t_r10`
+- `eval/t2i_r1`, `eval/t2i_r5`, `eval/t2i_r10`
 
 If the loss becomes `nan`, `inf`, or the epoch average never moves after several
 epochs, stop the run and check the learning rate, batch size, and dataset loading.

@@ -60,6 +60,12 @@ def parse_args(argv=None):
         default="eval",
         help="Optional split to evaluate at the end of each epoch. Set to none to disable.",
     )
+    parser.add_argument(
+        "--eval_retrieval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute retrieval metrics on the eval split at the end of each epoch.",
+    )
     parser.add_argument("--eval_subsample", type=int, default=None)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--eval_num_workers", type=int, default=4)
@@ -162,9 +168,23 @@ def count_parameters(model):
     return total, trainable
 
 
-def evaluate_loss(model, data_loader, device):
+def recall_at_k(sim_matrix, ks):
+    n = sim_matrix.shape[0]
+    ranked = sim_matrix.argsort(dim=-1, descending=True)
+    results = {}
+    for k in ks:
+        correct = (
+            ranked[:, :k] == torch.arange(n, device=ranked.device).unsqueeze(1)
+        ).any(dim=1)
+        results[f"R@{k}"] = correct.float().mean().item()
+    return results
+
+
+def evaluate_model(model, data_loader, device, compute_retrieval=False):
     model.eval()
     total_loss = 0.0
+    all_image_embeds = []
+    all_text_embeds = []
 
     with torch.no_grad():
         for batch in data_loader:
@@ -182,7 +202,29 @@ def evaluate_loss(model, data_loader, device):
                 raise RuntimeError(f"Non-finite eval loss: {loss.item()}")
             total_loss += loss.item()
 
-    return total_loss / len(data_loader)
+            if compute_retrieval:
+                all_image_embeds.append(F.normalize(outputs.image_embeds, dim=-1))
+                all_text_embeds.append(F.normalize(outputs.text_embeds, dim=-1))
+
+    metrics = {"eval_avg_loss": total_loss / len(data_loader)}
+    if compute_retrieval:
+        image_embeds = torch.cat(all_image_embeds)
+        text_embeds = torch.cat(all_text_embeds)
+        sim = image_embeds @ text_embeds.T
+        image_to_text = recall_at_k(sim, [1, 5, 10])
+        text_to_image = recall_at_k(sim.T, [1, 5, 10])
+        metrics.update(
+            {
+                "eval_i2t_r1": image_to_text["R@1"],
+                "eval_i2t_r5": image_to_text["R@5"],
+                "eval_i2t_r10": image_to_text["R@10"],
+                "eval_t2i_r1": text_to_image["R@1"],
+                "eval_t2i_r5": text_to_image["R@5"],
+                "eval_t2i_r10": text_to_image["R@10"],
+            }
+        )
+
+    return metrics
 
 
 def init_wandb(args, output_dir, device, total_params, trainable_params, steps_per_epoch):
@@ -216,6 +258,12 @@ def init_wandb(args, output_dir, device, total_params, trainable_params, steps_p
         "train/learning_rate",
         "train/epoch",
         "eval/epoch_avg_loss",
+        "eval/i2t_r1",
+        "eval/i2t_r5",
+        "eval/i2t_r10",
+        "eval/t2i_r1",
+        "eval/t2i_r5",
+        "eval/t2i_r10",
     ):
         wandb.define_metric(metric_name, step_metric="train/global_step")
     return run
@@ -239,6 +287,12 @@ def train_model(
         "running_avg_loss",
         "epoch_avg_loss",
         "eval_avg_loss",
+        "eval_i2t_r1",
+        "eval_i2t_r5",
+        "eval_i2t_r10",
+        "eval_t2i_r1",
+        "eval_t2i_r5",
+        "eval_t2i_r10",
         "learning_rate",
     ]
     previous_epoch_loss = None
@@ -311,6 +365,12 @@ def train_model(
                             "running_avg_loss": running_avg_loss,
                             "epoch_avg_loss": "",
                             "eval_avg_loss": "",
+                            "eval_i2t_r1": "",
+                            "eval_i2t_r5": "",
+                            "eval_i2t_r10": "",
+                            "eval_t2i_r1": "",
+                            "eval_t2i_r5": "",
+                            "eval_t2i_r10": "",
                             "learning_rate": learning_rate,
                         }
                     )
@@ -324,17 +384,27 @@ def train_model(
                 direction = "down" if delta < 0 else "up"
                 change_text = f"{direction} {abs(delta):.4f} from previous epoch"
 
-            eval_loss = None
+            eval_metrics = {}
             if eval_loader is not None:
-                eval_loss = evaluate_loss(model, eval_loader, device)
+                eval_metrics = evaluate_model(
+                    model,
+                    eval_loader,
+                    device,
+                    compute_retrieval=args.eval_retrieval,
+                )
                 model.train()
 
             epoch_summary = (
                 f"epoch {epoch + 1}/{args.epochs} complete "
                 f"epoch_avg_loss {epoch_loss:.4f}"
             )
-            if eval_loss is not None:
-                epoch_summary += f" eval_avg_loss {eval_loss:.4f}"
+            if eval_metrics:
+                epoch_summary += f" eval_avg_loss {eval_metrics['eval_avg_loss']:.4f}"
+                if args.eval_retrieval:
+                    epoch_summary += (
+                        f" i2t_r1 {eval_metrics['eval_i2t_r1']:.3f}"
+                        f" t2i_r1 {eval_metrics['eval_t2i_r1']:.3f}"
+                    )
             epoch_summary += f" ({change_text})"
             print(epoch_summary, flush=True)
             metrics_writer.writerow(
@@ -345,7 +415,13 @@ def train_model(
                     "batch_loss": "",
                     "running_avg_loss": "",
                     "epoch_avg_loss": epoch_loss,
-                    "eval_avg_loss": "" if eval_loss is None else eval_loss,
+                    "eval_avg_loss": eval_metrics.get("eval_avg_loss", ""),
+                    "eval_i2t_r1": eval_metrics.get("eval_i2t_r1", ""),
+                    "eval_i2t_r5": eval_metrics.get("eval_i2t_r5", ""),
+                    "eval_i2t_r10": eval_metrics.get("eval_i2t_r10", ""),
+                    "eval_t2i_r1": eval_metrics.get("eval_t2i_r1", ""),
+                    "eval_t2i_r5": eval_metrics.get("eval_t2i_r5", ""),
+                    "eval_t2i_r10": eval_metrics.get("eval_t2i_r10", ""),
                     "learning_rate": learning_rate,
                 }
             )
@@ -357,7 +433,23 @@ def train_model(
                         "train/epoch": epoch + 1,
                         "train/epoch_avg_loss": epoch_loss,
                         "train/learning_rate": learning_rate,
-                        **({"eval/epoch_avg_loss": eval_loss} if eval_loss is not None else {}),
+                        **(
+                            {"eval/epoch_avg_loss": eval_metrics["eval_avg_loss"]}
+                            if "eval_avg_loss" in eval_metrics
+                            else {}
+                        ),
+                        **(
+                            {
+                                "eval/i2t_r1": eval_metrics["eval_i2t_r1"],
+                                "eval/i2t_r5": eval_metrics["eval_i2t_r5"],
+                                "eval/i2t_r10": eval_metrics["eval_i2t_r10"],
+                                "eval/t2i_r1": eval_metrics["eval_t2i_r1"],
+                                "eval/t2i_r5": eval_metrics["eval_t2i_r5"],
+                                "eval/t2i_r10": eval_metrics["eval_t2i_r10"],
+                            }
+                            if args.eval_retrieval and eval_metrics
+                            else {}
+                        ),
                     }
                 )
             previous_epoch_loss = epoch_loss
