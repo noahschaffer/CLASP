@@ -51,7 +51,37 @@ Important arguments:
   Location of eval_segments.csv. This is provided when AudioSet is downloaded
 - `--hub_repo`
   HuggingFace Repo to write the CLASP dataset
-### CLASP DataLoader
+
+### CLASP Dataset
+
+A CLASP dataset is found at ```clasp/data/clasp_dataset.py```. It returns the following
+
+- `pixel_values`
+  Pixel values for the spectrogram
+- `input_ids`
+  Input IDs from the CLIPProcessor
+- `attention_mask`
+  Attention mask from the CLIPProcessor
+- `ytid`
+  YouTube ID of the data item, corresponds to the .wav file in AudioSet
+- `start`
+  Audio item start time
+- `label`
+  List of AudioSet labels for the given item
+
+A CLASP Dataset can be initialized as 
+
+```train_ds = CLASPDataset(
+        hub_repo=<dataset_repo>,
+        processor=<CLIP_processor>,
+        split=<train/eval>,
+        subsample=<subsample_number>,
+        cache_dir=<cache_dir>,
+        dataset_dir=<dataset_dir>,
+    )
+```
+
+
 
 ## Fine-tuning CLIP on CLASP data
 
@@ -64,7 +94,7 @@ python scripts/download_clasp_dataset.py
 This creates:
 
 - `data/hf_cache/`: Hugging Face download cache
-- `data/clasp-audioset-subset/`: local dataset copy
+- `data/clasp-audioset/`: local dataset copy
 
 The dataset rows contain:
 
@@ -77,7 +107,7 @@ The dataset rows contain:
 Verify the download:
 
 ```bash
-python -c "from datasets import load_from_disk; ds = load_from_disk('data/clasp-audioset-subset'); print(ds)"
+python -c "from datasets import load_from_disk; ds = load_from_disk('data/clasp-audioset'); print(ds)"
 ```
 
 If you only want the Hugging Face cache and not the extra local copy, run:
@@ -97,7 +127,7 @@ python clasp/train/train.py
 If you saved a local dataset copy with `python scripts/download_clasp_dataset.py`, point training at it with:
 
 ```bash
-python clasp/train/train.py --dataset_dir data/clasp-audioset-subset
+python clasp/train/train.py --dataset_dir data/clasp-audioset
 ```
 
 For a quick smoke test:
@@ -180,7 +210,7 @@ epochs, stop the run and check the learning rate, batch size, and dataset loadin
 ## Evaluation
 
 The evaluation script runs on the public Hugging Face dataset
-`noahschaffer/clasp-audioset-subset`, which contains the 100-example `eval`
+`noahschaffer/clasp-audioset`, which contains the 100-example `eval`
 split used for quick verification. You do not need to download raw AudioSet
 audio to run evaluation.
 
@@ -227,17 +257,22 @@ classification evaluation all work end to end.
 
 ```bash
 python clasp/eval/eval.py \
-  --hub_repo noahschaffer/clasp-audioset-subset \
+  --hub_repo noahschaffer/clasp-audioset \
   --split eval \
   --batch_size 16 \
   --output_json results/clasp_baseline_eval.json
 ```
 
+`--cache_dir` is optional. If you omit it, `clasp/eval/eval.py` uses the
+default Hugging Face cache for models and datasets. `--output_json` can be
+either a bare filename such as `clasp_baseline_eval.json` or a nested path such
+as `results/clasp_baseline_eval.json`.
+
 On a CPU-only laptop, add `--device cpu` and optionally use a temporary cache:
 
 ```bash
 ./.venv/bin/python3 clasp/eval/eval.py \
-  --hub_repo noahschaffer/clasp-audioset-subset \
+  --hub_repo noahschaffer/clasp-audioset \
   --split eval \
   --batch_size 16 \
   --cache_dir /private/tmp/clasp_hf_cache \
@@ -248,7 +283,7 @@ On a CPU-only laptop, add `--device cpu` and optionally use a temporary cache:
 A successful run should print lines like:
 
 ```text
-Loaded 100 records from noahschaffer/clasp-audioset-subset (eval)
+Loaded 100 records from noahschaffer/clasp-audioset (eval)
 --- Retrieval ---
 Spectrogram -> Text | R@1: ...
 Text -> Spectrogram | R@1: ...
@@ -264,7 +299,7 @@ After fine-tuning, the training script should save an adapter directory such as
 ```bash
 python clasp/eval/eval.py \
   --lora_path clasp-finetuned \
-  --hub_repo noahschaffer/clasp-audioset-subset \
+  --hub_repo noahschaffer/clasp-audioset \
   --split eval \
   --batch_size 32 \
   --output_json results/clasp_lora_eval.json
@@ -273,13 +308,55 @@ python clasp/eval/eval.py \
 In a CUDA environment, the script automatically uses CUDA when available. Use
 the same command without `--device cpu` for full GPU evaluation.
 
+### Run the LAION-CLAP evaluator
+
+`clasp/eval/eval_clap.py` evaluates LAION-CLAP on the CLASP Hugging Face split,
+but unlike `eval.py` it reconstructs raw audio paths from the dataset metadata,
+so you must provide a directory of downloaded `.wav` files via `--audio_dir`.
+
+The script expects filenames of the form `YTID_START.wav`, for example
+`abc123_30.wav`, and matches them against each dataset row's `ytid` and
+`start`.
+
+```bash
+python clasp/eval/eval_clap.py \
+  --hub_repo noahschaffer/clasp-audioset \
+  --split eval \
+  --audio_dir /path/to/audioset_wavs \
+  --class_labels_csv class_labels_indices.csv \
+  --output_json results/eval_clap.json
+```
+
+`--cache_dir` is optional here too. If you omit it, `clasp/eval/eval_clap.py`
+uses the normal Hugging Face cache instead of a cluster-specific path.
+`--output_json` accepts either a bare filename such as `eval_clap.json` or a
+nested path such as `results/eval_clap.json`.
+
+For a quick smoke test on a smaller slice:
+
+```bash
+python clasp/eval/eval_clap.py \
+  --audio_dir /path/to/audioset_wavs \
+  --subsample 16 \
+  --batch_size 8 \
+  --output_json eval_clap_smoke.json
+```
+
+The CLAP evaluator reports:
+
+- audio-to-text retrieval: `R@1`, `R@5`, `R@10` with bootstrap confidence intervals
+- text-to-audio retrieval: `R@1`, `R@5`, `R@10` with bootstrap confidence intervals
+- multi-label AudioSet classification: `mAP` with a bootstrap confidence interval
+
 ### Notes on external code and checkpoints
 
 Evaluation uses Hugging Face Transformers for CLIP model loading, the LAION
 checkpoint `laion/CLIP-ViT-B-32-laion2B-s34B-b79K`, Hugging Face Datasets for
-`noahschaffer/clasp-audioset-subset`, and PEFT when loading LoRA adapters. The
+`noahschaffer/clasp-audioset`, and PEFT when loading LoRA adapters. The
 retrieval and multi-label AudioSet mAP evaluation logic in `clasp/eval/eval.py`
 is project code.
+`clasp/eval/eval_clap.py` uses `laion-clap` for audio/text embedding and the
+same Hugging Face dataset metadata to align captions, labels, and local audio
+files.
 This project uses the processed Hugging Face dataset
-`noahschaffer/clasp-audioset-subset`.
-
+`noahschaffer/clasp-audioset`.
