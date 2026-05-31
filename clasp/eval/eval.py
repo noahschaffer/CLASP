@@ -23,7 +23,7 @@ import sys
 import urllib.request
 from pathlib import Path
 from typing import Any
-
+from tqdm import trange
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -184,6 +184,69 @@ def load_model_and_processor(
     model.eval()
     return model, processor
 
+
+def bootstrap_retrieval(sim_matrix: np.ndarray, ks: tuple[int, ...], n_bootstrap: int = 100, ci: int = 95) -> dict:
+    n = sim_matrix.shape[0]
+    results = {f"R@{k}": [] for k in ks}
+
+    for _ in trange(n_bootstrap, desc="Bootstrap retrieval"):
+        idx = np.random.choice(n, size=n, replace=True)
+        sim_resampled = sim_matrix[idx]
+        ranked = sim_resampled.argsort(axis=-1)[:, ::-1]
+        for k in ks:
+            correct = (ranked[:, :k] == idx.reshape(-1, 1)).any(axis=1)
+            results[f"R@{k}"].append(correct.mean())
+
+    alpha = (100 - ci) / 2
+    return {
+        k: {
+            "mean": float(np.mean(v)),
+            "lower": float(np.percentile(v, alpha)),
+            "upper": float(np.percentile(v, 100 - alpha)),
+        }
+        for k, v in results.items()
+    }
+
+
+def bootstrap_map(scores: np.ndarray, targets: np.ndarray, n_bootstrap: int = 100, ci: int = 95) -> dict:
+    n, n_classes = scores.shape
+    maps = []
+
+    # Precompute sort order once
+    order = np.argsort(-scores, axis=0)  # (N, n_classes)
+    sorted_scores = np.take_along_axis(scores, order, axis=0)
+    sorted_targets = np.take_along_axis(targets, order, axis=0)
+    ranks = np.arange(1, n + 1, dtype=np.float32).reshape(-1, 1)
+
+    for _ in trange(n_bootstrap, desc="Bootstrap mAP"):
+        idx = np.random.choice(n, size=n, replace=True)
+
+        # Resample and re-sort only the resampled rows
+        s = sorted_scores[idx]
+        t = sorted_targets[idx]
+
+        # Re-sort resampled rows
+        resample_order = np.argsort(-s, axis=0)
+        t = np.take_along_axis(t, resample_order, axis=0)
+
+        tp_cumsum = np.cumsum(t, axis=0)
+        precision_at_hits = (tp_cumsum / ranks) * t
+        positives = t.sum(axis=0)
+
+        with np.errstate(invalid="ignore"):
+            ap_per_class = np.where(
+                positives > 0,
+                precision_at_hits.sum(axis=0) / positives,
+                np.nan
+            )
+        maps.append(float(np.nanmean(ap_per_class)))
+
+    alpha = (100 - ci) / 2
+    return {
+        "mean": float(np.mean(maps)),
+        "lower": float(np.percentile(maps, alpha)),
+        "upper": float(np.percentile(maps, 100 - alpha)),
+    }
 
 def feature_model(model: torch.nn.Module) -> torch.nn.Module:
     """Return the underlying CLIP model, preserving active PEFT adapters."""
@@ -479,9 +542,18 @@ def main() -> None:
     print(f"Encoding {len(dataset)} examples...", flush=True)
     image_embeds, text_embeds, label_rows = encode_eval_split(model, loader, device)
 
+    # Similarity matrix used for both retrieval and bootstrap
+    sim_matrix = (image_embeds @ text_embeds.T).numpy()
+
+    # Retrieval
     print("Evaluating retrieval...", flush=True)
     retrieval = evaluate_retrieval(image_embeds, text_embeds)
 
+    print("Bootstrap CIs for retrieval...", flush=True)
+    retrieval_ci_s2t = bootstrap_retrieval(sim_matrix, ks=(1, 5, 10))
+    retrieval_ci_t2s = bootstrap_retrieval(sim_matrix.T, ks=(1, 5, 10))
+
+    # Classification
     class_rows, class_label_source = load_class_labels(
         args.class_labels_csv,
         args.class_labels_url,
@@ -509,21 +581,37 @@ def main() -> None:
         class_rows,
     )
 
+    # Scores and targets for bootstrap mAP
+    mid_to_idx = {row["mid"]: idx for idx, row in enumerate(class_rows)}
+    targets = np.zeros((len(label_rows), len(class_rows)), dtype=np.float32)
+    for row_idx, labels in enumerate(label_rows):
+        for mid in labels:
+            class_idx = mid_to_idx.get(mid)
+            if class_idx is not None:
+                targets[row_idx, class_idx] = 1.0
+    scores = (image_embeds @ label_embeds.cpu().T).numpy()
+
+    print("Bootstrap CIs for mAP...", flush=True)
+    map_ci = bootstrap_map(scores, targets)
+
+    # Print results
     print("\n--- Retrieval ---", flush=True)
-    print_retrieval_block(
-        "Spectrogram -> Text",
-        retrieval["spectrogram_to_text"],
-    )
-    print_retrieval_block(
-        "Text -> Spectrogram",
-        retrieval["text_to_spectrogram"],
-    )
+    for direction, dir_key, ci in [
+        ("Spectrogram -> Text", "spectrogram_to_text", retrieval_ci_s2t),
+        ("Text -> Spectrogram", "text_to_spectrogram", retrieval_ci_t2s),
+    ]:
+        m = retrieval[dir_key]
+        print(f"{direction}", flush=True)
+        for k in (1, 5, 10):
+            c = ci[f"R@{k}"]
+            print(f"  R@{k}: {m[f'R@{k}']:.3f} [{c['lower']:.3f}, {c['upper']:.3f}]", flush=True)
+        print(f"  MedR: {m['median_rank']:.1f}  MeanR: {m['mean_rank']:.1f}", flush=True)
 
     print("\n--- Classification ---", flush=True)
     print(
         f"mAP: {classification['mAP']:.4f} "
-        f"(over {classification['n_classes_evaluated']} classes with positives; "
-        f"{classification['n_classes_total']} prompts total)",
+        f"[{map_ci['lower']:.4f}, {map_ci['upper']:.4f}] "
+        f"(over {classification['n_classes_evaluated']} classes)",
         flush=True,
     )
 
@@ -536,6 +624,11 @@ def main() -> None:
         "class_label_source": class_label_source,
         "retrieval": retrieval,
         "classification": classification,
+        "retrieval_ci": {
+            "spectrogram_to_text": retrieval_ci_s2t,
+            "text_to_spectrogram": retrieval_ci_t2s,
+        },
+        "map_ci": map_ci,
     }
 
     if args.output_json is not None:
