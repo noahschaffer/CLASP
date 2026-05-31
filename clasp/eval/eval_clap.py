@@ -6,6 +6,7 @@ import pandas as pd
 import argparse
 import torch.nn.functional as F
 import laion_clap
+from pathlib import Path
 
 from datasets import load_dataset
 from sklearn.metrics import average_precision_score
@@ -18,7 +19,11 @@ from tqdm import trange
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--hub_repo", default="noahschaffer/clasp-audioset")
-    parser.add_argument("--cache_dir", default="/dartfs/rc/lab/S/SinghN/shared/hf_cache")
+    parser.add_argument(
+        "--cache_dir",
+        default=None,
+        help="Optional Hugging Face cache directory for downloaded dataset files.",
+    )
     parser.add_argument("--audio_dir", required=True,
                         help="Directory containing downloaded .wav files")
     parser.add_argument("--class_labels_csv", default="class_labels_indices.csv")
@@ -307,8 +312,8 @@ def main():
     }
 
     if args.output_json is not None:
-        output_path = args.output_json
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(metrics, f, indent=2)
         print(f"\nWrote metrics to {output_path}", flush=True)
