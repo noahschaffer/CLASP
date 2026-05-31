@@ -71,7 +71,8 @@ A CLASP dataset is found at ```clasp/data/clasp_dataset.py```. It returns the fo
 
 A CLASP Dataset can be initialized as 
 
-```train_ds = CLASPDataset(
+```
+train_ds = CLASPDataset(
         hub_repo=<dataset_repo>,
         processor=<CLIP_processor>,
         split=<train/eval>,
